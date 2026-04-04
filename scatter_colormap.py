@@ -1,5 +1,5 @@
 """
-umap_colormap.py — 通用单细胞 UMAP 层级化自动配色工具
+scatter_colormap.py — 通用单细胞 UMAP 层级化自动配色工具
 =====================================================
 
 根据任意 2D 降维坐标（UMAP / tSNE / PCA）和 cell type 标签，
@@ -15,7 +15,7 @@ umap_colormap.py — 通用单细胞 UMAP 层级化自动配色工具
   5. 组内从偏移位顺延取色
 
 Quick Start:
-  >>> from umap_colormap import assign_celltype_colors, plot_umap
+  >>> from scatter_colormap import assign_celltype_colors, plot_umap
   >>> colors = assign_celltype_colors(adata.obsm["X_umap"], adata.obs["cell_type"])
   >>> plot_umap(adata.obsm["X_umap"], adata.obs["cell_type"], colors, save_path="umap.png")
 
@@ -129,6 +129,8 @@ def assign_celltype_colors(
     centroids = _compute_centroids(coords, labels, unique_types)
     Z = linkage(centroids, method="ward")
 
+    if n_major_groups is not None and n_major_groups < 1:
+        raise ValueError(f"n_major_groups must be >= 1, got {n_major_groups}")
     if n_major_groups is None:
         n_major_groups = _auto_determine_k(Z, n_types)
     n_major_groups = min(n_major_groups, n_types)
@@ -146,8 +148,9 @@ def assign_celltype_colors(
     if n_groups <= n_pal // 2:
         offsets = [i * 2 for i in range(n_groups)]           # 步长 2
     else:
-        offsets = list(range(0, n_pal, 2)) + list(range(1, n_pal, 2))
-        offsets = offsets[:n_groups]
+        base = list(range(0, n_pal, 2)) + list(range(1, n_pal, 2))
+        # cycle when n_groups > n_pal
+        offsets = [base[i % len(base)] for i in range(n_groups)]
 
     # Step 5: 组内顺延取色
     color_map: dict[str, str] = {}
@@ -171,15 +174,64 @@ def get_groups(
     dict[int, list[str]]
         group_id → [cell_type, ...]，每组首位是 dominant subtype。
     """
-    labels = np.asarray(labels)
+    coords, labels = _validate_inputs(coords, labels)
     unique_types = np.unique(labels)
     centroids = _compute_centroids(coords, labels, unique_types)
     Z = linkage(centroids, method="ward")
+    if n_major_groups is not None and n_major_groups < 1:
+        raise ValueError(f"n_major_groups must be >= 1, got {n_major_groups}")
     if n_major_groups is None:
         n_major_groups = _auto_determine_k(Z, len(unique_types))
     n_major_groups = min(n_major_groups, len(unique_types))
     major_labels = fcluster(Z, t=n_major_groups, criterion="maxclust")
     return _build_ordered_groups(unique_types, major_labels, labels, Z)
+
+
+def color_h5ad(
+    path: str,
+    label_key: str = "cell_type",
+    embedding_key: str = "X_umap",
+    n_major_groups: int | None = None,
+    palette: list[str] | None = None,
+) -> dict[str, str]:
+    """
+    从 h5ad 文件 (backed 模式) 直接生成配色，不加载表达矩阵。
+
+    Parameters
+    ----------
+    path : str
+        h5ad 文件路径。
+    label_key : str
+        obs 中的标签列名，默认 ``"cell_type"``。
+    embedding_key : str
+        obsm 中的降维 key，默认 ``"X_umap"``。
+    n_major_groups, palette : 同 ``assign_celltype_colors``。
+
+    Returns
+    -------
+    dict[str, str]
+        label → hex color 映射。
+    """
+    import anndata as ad
+
+    adata = ad.read_h5ad(path, backed="r")
+    try:
+        if embedding_key not in adata.obsm:
+            avail = list(adata.obsm.keys())
+            raise KeyError(
+                f"Embedding '{embedding_key}' not found. Available: {avail}"
+            )
+        if label_key not in adata.obs.columns:
+            avail = list(adata.obs.columns)
+            raise KeyError(
+                f"Label column '{label_key}' not found. Available: {avail}"
+            )
+        coords = np.asarray(adata.obsm[embedding_key][:, :2])
+        labels = np.asarray(adata.obs[label_key])
+    finally:
+        adata.file.close()
+
+    return assign_celltype_colors(coords, labels, n_major_groups, palette)
 
 
 # ══════════════════════════════════════════════════════════

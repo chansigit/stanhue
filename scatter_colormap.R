@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# umap_colormap.R — 通用单细胞 UMAP 层级化自动配色工具 (R 版)
+# scatter_colormap.R — 通用单细胞 UMAP 层级化自动配色工具 (R 版)
 # ══════════════════════════════════════════════════════════════════════════════
 #
 # 根据任意 2D 降维坐标（UMAP / tSNE / PCA）和 cell type 标签，
@@ -15,7 +15,7 @@
 #   5. 组内从偏移位顺延取色
 #
 # Quick Start:
-#   source("umap_colormap.R")
+#   source("scatter_colormap.R")
 #   colors <- assign_celltype_colors(umap_coords, cell_type_labels)
 #   plot_umap(umap_coords, cell_type_labels, colors)
 #
@@ -106,6 +106,8 @@ assign_celltype_colors <- function(coords, labels,
   centroids <- .compute_centroids(coords, labels, unique_types)
   hc <- hclust(dist(centroids), method = "ward.D2")
 
+  if (!is.null(n_major_groups) && n_major_groups < 1)
+    stop("n_major_groups must be >= 1, got ", n_major_groups, call. = FALSE)
   if (is.null(n_major_groups)) {
     n_major_groups <- .auto_determine_k(hc, n_types)
   }
@@ -125,8 +127,9 @@ assign_celltype_colors <- function(coords, labels,
   if (n_groups <= n_pal %/% 2) {
     offsets <- seq(0, by = 2, length.out = n_groups)   # 步长 2
   } else {
-    offsets <- c(seq(0, n_pal - 1, by = 2), seq(1, n_pal - 1, by = 2))
-    offsets <- offsets[seq_len(n_groups)]
+    base <- c(seq(0, n_pal - 1, by = 2), seq(1, n_pal - 1, by = 2))
+    # cycle when n_groups > n_pal
+    offsets <- base[((seq_len(n_groups) - 1) %% length(base)) + 1]
   }
 
   # Step 5: 组内顺延取色 (0-indexed offset, 转 1-indexed palette)
@@ -150,14 +153,17 @@ assign_celltype_colors <- function(coords, labels,
 #' @inheritParams assign_celltype_colors
 #' @return named list: group_id → character vector of cell types (首位是 dominant)
 get_groups <- function(coords, labels, n_major_groups = NULL) {
-  coords <- as.matrix(coords)
-  labels <- as.character(labels)
+  validated <- .validate_inputs(coords, labels)
+  coords <- validated$coords
+  labels <- validated$labels
   unique_types <- sort(unique(labels))
   n_types <- length(unique_types)
 
   centroids <- .compute_centroids(coords, labels, unique_types)
   hc <- hclust(dist(centroids), method = "ward.D2")
 
+  if (!is.null(n_major_groups) && n_major_groups < 1)
+    stop("n_major_groups must be >= 1, got ", n_major_groups, call. = FALSE)
   if (is.null(n_major_groups)) {
     n_major_groups <- .auto_determine_k(hc, n_types)
   }

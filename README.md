@@ -18,6 +18,31 @@
 
 ---
 
+## Gallery
+
+All plots below are generated fully automatically — no manual color picking.
+
+<table>
+<tr>
+<td align="center"><strong>PBMC CITE-seq (57 cell types)</strong></td>
+<td align="center"><strong>Brain (21 cell types, 2.5M cells)</strong></td>
+</tr>
+<tr>
+<td><img src="pbmc_umap.png" width="100%"/></td>
+<td><img src="brain_umap.png" width="100%"/></td>
+</tr>
+<tr>
+<td align="center"><strong>Heart (17 cell types)</strong></td>
+<td align="center"><strong>Meniscus (15 cell types)</strong></td>
+</tr>
+<tr>
+<td><img src="heart_umap.png" width="100%"/></td>
+<td><img src="meniscus_umap.png" width="100%"/></td>
+</tr>
+</table>
+
+---
+
 ## Why?
 
 When a scatter plot has dozens of categories (e.g., 30+ cell types on a UMAP),
