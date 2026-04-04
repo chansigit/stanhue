@@ -82,12 +82,48 @@ def _validate_inputs(
 #  核心 API
 # ══════════════════════════════════════════════════════════
 
+def _cluster_pipeline(
+    coords: np.ndarray,
+    labels: np.ndarray,
+    n_major_groups: int | None = None,
+) -> tuple[dict[int, list[str]], np.ndarray, np.ndarray, np.ndarray]:
+    """共享聚类流水线，返回 (groups, unique_types, type_counts, Z)。"""
+    coords, labels = _validate_inputs(coords, labels)
+
+    # 向量化：字符串标签 → 整数编码，后续全部用整数操作
+    unique_types, codes = np.unique(labels, return_inverse=True)
+    n_types = len(unique_types)
+
+    if n_types < 2:
+        groups: dict[int, list[str]] = {}
+        if n_types == 1:
+            groups[1] = [unique_types[0]]
+        type_counts = np.bincount(codes, minlength=n_types)
+        return groups, unique_types, type_counts, np.empty((0, 4))
+
+    # 向量化质心计算
+    centroids = _compute_centroids_fast(coords, codes, n_types)
+    Z = linkage(centroids, method="ward")
+
+    if n_major_groups is not None and n_major_groups < 1:
+        raise ValueError(f"n_major_groups must be >= 1, got {n_major_groups}")
+    if n_major_groups is None:
+        n_major_groups = _auto_determine_k(Z, n_types)
+    n_major_groups = min(n_major_groups, n_types)
+
+    major_labels = fcluster(Z, t=n_major_groups, criterion="maxclust")
+    type_counts = np.bincount(codes, minlength=n_types)
+    groups = _build_ordered_groups(unique_types, major_labels, type_counts, Z)
+    return groups, unique_types, type_counts, Z
+
+
 def assign_celltype_colors(
     coords: np.ndarray,
     labels: np.ndarray,
     n_major_groups: int | None = None,
     palette: list[str] | None = None,
-) -> dict[str, str]:
+    return_groups: bool = False,
+) -> dict[str, str] | tuple[dict[str, str], dict[int, list[str]]]:
     """
     给定 2D 坐标和细胞标签，返回 ``{cell_type: hex_color}``。
 
@@ -102,54 +138,45 @@ def assign_celltype_colors(
     palette : list[str] | None
         组内有序调色板。``None`` 使用 ``PAIRED_PALETTE``。
         可传入任意长度的 hex 颜色列表。
+    return_groups : bool
+        若为 True，同时返回分组信息，避免重复聚类。
 
     Returns
     -------
-    dict[str, str]
-        cell_type → hex color 映射。
+    dict[str, str]  或  (dict[str, str], dict[int, list[str]])
+        cell_type → hex color 映射。若 return_groups=True，额外返回分组。
     """
-    coords, labels = _validate_inputs(coords, labels)
-
     if palette is None:
         palette = PAIRED_PALETTE
     n_pal = len(palette)
 
-    unique_types = np.unique(labels)
+    groups, unique_types, type_counts, Z = _cluster_pipeline(
+        coords, labels, n_major_groups,
+    )
     n_types = len(unique_types)
 
     # 边界情况
     if n_types == 0:
-        return {}
+        return ({}, {}) if return_groups else {}
     if n_types == 1:
-        return {unique_types[0]: palette[0]}
+        cm = {unique_types[0]: palette[0]}
+        return (cm, groups) if return_groups else cm
     if n_types <= n_pal and n_major_groups is None:
-        return {ct: palette[i] for i, ct in enumerate(unique_types)}
-
-    # Step 1–3: 聚类 + 分组 + 组内排序
-    centroids = _compute_centroids(coords, labels, unique_types)
-    Z = linkage(centroids, method="ward")
-
-    if n_major_groups is not None and n_major_groups < 1:
-        raise ValueError(f"n_major_groups must be >= 1, got {n_major_groups}")
-    if n_major_groups is None:
-        n_major_groups = _auto_determine_k(Z, n_types)
-    n_major_groups = min(n_major_groups, n_types)
-
-    major_labels = fcluster(Z, t=n_major_groups, criterion="maxclust")
-    groups = _build_ordered_groups(unique_types, major_labels, labels, Z)
+        cm = {ct: palette[i] for i, ct in enumerate(unique_types)}
+        return (cm, groups) if return_groups else cm
 
     # Step 4: 按总细胞数排序，分配偏移
-    cell_counts = Counter(labels)
     sorted_gids = sorted(
-        groups, key=lambda g: -sum(cell_counts[ct] for ct in groups[g])
+        groups,
+        key=lambda g: -sum(type_counts[np.searchsorted(unique_types, ct)]
+                           for ct in groups[g]),
     )
     n_groups = len(sorted_gids)
 
     if n_groups <= n_pal // 2:
-        offsets = [i * 2 for i in range(n_groups)]           # 步长 2
+        offsets = [i * 2 for i in range(n_groups)]
     else:
         base = list(range(0, n_pal, 2)) + list(range(1, n_pal, 2))
-        # cycle when n_groups > n_pal
         offsets = [base[i % len(base)] for i in range(n_groups)]
 
     # Step 5: 组内顺延取色
@@ -158,7 +185,7 @@ def assign_celltype_colors(
         for i, ct in enumerate(groups[gid]):
             color_map[ct] = palette[(offset + i) % n_pal]
 
-    return color_map
+    return (color_map, groups) if return_groups else color_map
 
 
 def get_groups(
@@ -174,17 +201,8 @@ def get_groups(
     dict[int, list[str]]
         group_id → [cell_type, ...]，每组首位是 dominant subtype。
     """
-    coords, labels = _validate_inputs(coords, labels)
-    unique_types = np.unique(labels)
-    centroids = _compute_centroids(coords, labels, unique_types)
-    Z = linkage(centroids, method="ward")
-    if n_major_groups is not None and n_major_groups < 1:
-        raise ValueError(f"n_major_groups must be >= 1, got {n_major_groups}")
-    if n_major_groups is None:
-        n_major_groups = _auto_determine_k(Z, len(unique_types))
-    n_major_groups = min(n_major_groups, len(unique_types))
-    major_labels = fcluster(Z, t=n_major_groups, criterion="maxclust")
-    return _build_ordered_groups(unique_types, major_labels, labels, Z)
+    groups, _, _, _ = _cluster_pipeline(coords, labels, n_major_groups)
+    return groups
 
 
 def color_h5ad(
@@ -456,13 +474,15 @@ def plot_palette(
 #  内部工具
 # ══════════════════════════════════════════════════════════
 
-def _compute_centroids(
-    coords: np.ndarray, labels: np.ndarray, unique_types: np.ndarray,
+def _compute_centroids_fast(
+    coords: np.ndarray, codes: np.ndarray, n_types: int,
 ) -> np.ndarray:
-    centroids = np.zeros((len(unique_types), 2))
-    for i, ct in enumerate(unique_types):
-        centroids[i] = coords[labels == ct].mean(axis=0)
-    return centroids
+    """向量化质心计算：用整数编码 + bincount 代替逐类 Python 循环。"""
+    counts = np.bincount(codes, minlength=n_types).astype(float)
+    counts[counts == 0] = 1  # 避免除零
+    sum_x = np.bincount(codes, weights=coords[:, 0], minlength=n_types)
+    sum_y = np.bincount(codes, weights=coords[:, 1], minlength=n_types)
+    return np.column_stack([sum_x / counts, sum_y / counts])
 
 
 def _auto_determine_k(Z: np.ndarray, n_types: int) -> int:
@@ -480,21 +500,29 @@ def _auto_determine_k(Z: np.ndarray, n_types: int) -> int:
 def _build_ordered_groups(
     unique_types: np.ndarray,
     major_labels: np.ndarray,
-    all_labels: np.ndarray,
+    type_counts: np.ndarray,
     Z: np.ndarray,
 ) -> dict[int, list[str]]:
-    """构建分组映射，每组 dominant 排首位，其余按叶序。"""
+    """构建分组映射，每组 dominant 排首位，其余按叶序。
+
+    Parameters
+    ----------
+    type_counts : ndarray, shape (n_types,)
+        每个 unique_type 的细胞计数（与 unique_types 对齐）。
+    """
+    # 建立 type → index 映射
+    type_to_idx = {ct: i for i, ct in enumerate(unique_types)}
+
     groups: dict[int, list[str]] = {}
     for ct, ml in zip(unique_types, major_labels):
         groups.setdefault(int(ml), []).append(ct)
 
-    cell_counts = Counter(all_labels)
     leaf_order = leaves_list(Z)
     type_order = {unique_types[i]: r for r, i in enumerate(leaf_order)}
 
     for gid in groups:
         members = groups[gid]
-        dominant = max(members, key=lambda ct: cell_counts[ct])
+        dominant = max(members, key=lambda ct: type_counts[type_to_idx[ct]])
         rest = sorted(
             [ct for ct in members if ct != dominant],
             key=lambda ct: type_order.get(ct, 0),

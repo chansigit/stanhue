@@ -75,35 +75,29 @@ PAIRED_PALETTE <- c(
 #  核心 API
 # ══════════════════════════════════════════════════════════════════════════════
 
-#' 给定 2D 坐标和细胞标签，返回 named vector: cell_type → hex_color
-#'
-#' @param coords     matrix/data.frame, n_cells x 2, 任意 2D 降维坐标
-#' @param labels     character vector, 长度 n_cells, 每个细胞的类型标签
-#' @param n_major_groups  integer|NULL, 手动指定大类数量。NULL 自动确定
-#' @param palette    character vector, 有序调色板。NULL 使用 PAIRED_PALETTE
-#' @return named character vector: cell_type → hex color
-assign_celltype_colors <- function(coords, labels,
-                                   n_major_groups = NULL,
-                                   palette = NULL) {
+#' 共享聚类流水线（内部函数）
+#' @return list(groups, unique_types, type_counts)
+.cluster_pipeline <- function(coords, labels, n_major_groups = NULL) {
   validated <- .validate_inputs(coords, labels)
   coords <- validated$coords
   labels <- validated$labels
 
-  if (is.null(palette)) palette <- PAIRED_PALETTE
-  n_pal <- length(palette)
-
   unique_types <- sort(unique(labels))
   n_types <- length(unique_types)
 
-  # 边界情况
-  if (n_types == 0) return(character(0))
-  if (n_types == 1) return(setNames(palette[1], unique_types))
-  if (n_types <= n_pal && is.null(n_major_groups)) {
-    return(setNames(palette[seq_len(n_types)], unique_types))
+  if (n_types < 2) {
+    groups <- list()
+    type_counts <- integer(0)
+    if (n_types == 1) {
+      groups[["1"]] <- unique_types
+      type_counts <- setNames(sum(labels == unique_types), unique_types)
+    }
+    return(list(groups = groups, unique_types = unique_types,
+                type_counts = type_counts))
   }
 
-  # Step 1-3: 聚类 + 分组 + 组内排序
-  centroids <- .compute_centroids(coords, labels, unique_types)
+  # 向量化质心计算
+  centroids <- .compute_centroids_fast(coords, labels, unique_types)
   hc <- hclust(dist(centroids), method = "ward.D2")
 
   if (!is.null(n_major_groups) && n_major_groups < 1)
@@ -113,13 +107,49 @@ assign_celltype_colors <- function(coords, labels,
   }
   n_major_groups <- min(n_major_groups, n_types)
 
-  cluster_ids <- cutree(hc, k = n_major_groups)  # named by row
-  groups <- .build_ordered_groups(unique_types, cluster_ids, labels, hc)
+  cluster_ids <- cutree(hc, k = n_major_groups)
+  type_counts <- table(labels)[unique_types]
+  groups <- .build_ordered_groups(unique_types, cluster_ids, type_counts, hc)
+  list(groups = groups, unique_types = unique_types,
+       type_counts = type_counts)
+}
+
+
+#' 给定 2D 坐标和细胞标签，返回 named vector: cell_type → hex_color
+#'
+#' @param coords     matrix/data.frame, n_cells x 2, 任意 2D 降维坐标
+#' @param labels     character vector, 长度 n_cells, 每个细胞的类型标签
+#' @param n_major_groups  integer|NULL, 手动指定大类数量。NULL 自动确定
+#' @param palette    character vector, 有序调色板。NULL 使用 PAIRED_PALETTE
+#' @param return_groups  logical, 若 TRUE 返回 list(colors, groups)
+#' @return named character vector: cell_type → hex color;
+#'         若 return_groups=TRUE, 返回 list(colors=..., groups=...)
+assign_celltype_colors <- function(coords, labels,
+                                   n_major_groups = NULL,
+                                   palette = NULL,
+                                   return_groups = FALSE) {
+  if (is.null(palette)) palette <- PAIRED_PALETTE
+  n_pal <- length(palette)
+
+  res <- .cluster_pipeline(coords, labels, n_major_groups)
+  groups <- res$groups
+  unique_types <- res$unique_types
+  type_counts <- res$type_counts
+  n_types <- length(unique_types)
+
+  # 边界情况
+  .ret <- function(cm) {
+    if (return_groups) list(colors = cm, groups = groups) else cm
+  }
+  if (n_types == 0) return(.ret(character(0)))
+  if (n_types == 1) return(.ret(setNames(palette[1], unique_types)))
+  if (n_types <= n_pal && is.null(n_major_groups)) {
+    return(.ret(setNames(palette[seq_len(n_types)], unique_types)))
+  }
 
   # Step 4: 按总细胞数排序，分配偏移
-  cell_counts <- table(labels)
   group_totals <- vapply(groups, function(members) {
-    sum(cell_counts[members])
+    sum(type_counts[members])
   }, numeric(1))
   sorted_gids <- names(sort(group_totals, decreasing = TRUE))
   n_groups <- length(sorted_gids)
@@ -144,7 +174,7 @@ assign_celltype_colors <- function(coords, labels,
     }
   }
 
-  return(color_map)
+  .ret(color_map)
 }
 
 
@@ -153,24 +183,7 @@ assign_celltype_colors <- function(coords, labels,
 #' @inheritParams assign_celltype_colors
 #' @return named list: group_id → character vector of cell types (首位是 dominant)
 get_groups <- function(coords, labels, n_major_groups = NULL) {
-  validated <- .validate_inputs(coords, labels)
-  coords <- validated$coords
-  labels <- validated$labels
-  unique_types <- sort(unique(labels))
-  n_types <- length(unique_types)
-
-  centroids <- .compute_centroids(coords, labels, unique_types)
-  hc <- hclust(dist(centroids), method = "ward.D2")
-
-  if (!is.null(n_major_groups) && n_major_groups < 1)
-    stop("n_major_groups must be >= 1, got ", n_major_groups, call. = FALSE)
-  if (is.null(n_major_groups)) {
-    n_major_groups <- .auto_determine_k(hc, n_types)
-  }
-  n_major_groups <- min(n_major_groups, n_types)
-
-  cluster_ids <- cutree(hc, k = n_major_groups)
-  .build_ordered_groups(unique_types, cluster_ids, labels, hc)
+  .cluster_pipeline(coords, labels, n_major_groups)$groups
 }
 
 
@@ -388,13 +401,15 @@ color_sce <- function(sce, dimred = "UMAP", col_name = "cell_type", ...) {
 #  内部工具函数
 # ══════════════════════════════════════════════════════════════════════════════
 
-.compute_centroids <- function(coords, labels, unique_types) {
-  centroids <- matrix(0, nrow = length(unique_types), ncol = 2)
+.compute_centroids_fast <- function(coords, labels, unique_types) {
+  # 向量化：用 factor + rowsum 代替逐类 Python 循环
+  f <- factor(labels, levels = unique_types)
+  codes <- as.integer(f)
+  sums <- rowsum(coords, codes, reorder = FALSE)
+  counts <- tabulate(codes, nbins = length(unique_types))
+  counts[counts == 0] <- 1  # 避免除零
+  centroids <- sums / counts
   rownames(centroids) <- unique_types
-  for (i in seq_along(unique_types)) {
-    mask <- labels == unique_types[i]
-    centroids[i, ] <- colMeans(coords[mask, , drop = FALSE])
-  }
   centroids
 }
 
@@ -417,18 +432,17 @@ color_sce <- function(sce, dimred = "UMAP", col_name = "cell_type", ...) {
 }
 
 
-.build_ordered_groups <- function(unique_types, cluster_ids, all_labels, hc) {
-  # cluster_ids: named vector (names = unique_types 的行号对应名称)
+.build_ordered_groups <- function(unique_types, cluster_ids, type_counts, hc) {
+  # cluster_ids: named vector; type_counts: named vector aligned with unique_types
   groups <- split(unique_types, cluster_ids)
 
-  cell_counts <- table(all_labels)
   # dendrogram 叶序
   leaf_order <- hc$order  # 1-indexed positions
   type_order <- setNames(seq_along(leaf_order), unique_types[leaf_order])
 
   groups <- lapply(groups, function(members) {
     # dominant = 细胞数最多的
-    counts_m <- cell_counts[members]
+    counts_m <- type_counts[members]
     dominant <- names(which.max(counts_m))
     rest <- setdiff(members, dominant)
     rest <- rest[order(type_order[rest])]
