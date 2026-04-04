@@ -41,6 +41,11 @@ All plots below are generated fully automatically — no manual color picking.
 </tr>
 </table>
 
+<details>
+<summary><strong>Brain — 382 clusters, 83 auto-groups (click to expand)</strong></summary>
+<img src="brain_cluster_umap.png" width="100%"/>
+</details>
+
 ---
 
 ## Why?
