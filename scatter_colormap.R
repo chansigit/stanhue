@@ -416,6 +416,7 @@ color_sce <- function(sce, dimred = "UMAP", col_name = "cell_type", ...) {
 
 .auto_determine_k <- function(hc, n_types) {
   # 在 dendrogram 合并距离中找最大相对间距跳跃
+  # 搜索窗口和 k 上限随 n_types 自适应缩放
   if (n_types <= 3) return(n_types)
 
   heights <- hc$height  # 已排序（升序）
@@ -423,12 +424,13 @@ color_sce <- function(sce, dimred = "UMAP", col_name = "cell_type", ...) {
   rel_gaps <- gaps / (heights[-length(heights)] + 1e-10)
 
   n_gaps <- length(rel_gaps)
-  search_start <- max(1, n_gaps - min(25, n_types - 1) + 1)
+  window <- min(n_types - 1, max(25, n_types %/% 3))
+  search_start <- max(1, n_gaps - window + 1)
   best_idx <- search_start - 1 + which.max(rel_gaps[search_start:n_gaps])
 
-  # best_idx 是在 heights 中的位置；对应切 k 个簇
   k <- n_types - best_idx
-  max(3, min(k, 15))
+  k_max <- max(15, n_types %/% 4)
+  max(3, min(k, k_max))
 }
 
 

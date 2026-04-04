@@ -162,6 +162,8 @@ def assign_celltype_colors(
         cm = {unique_types[0]: palette[0]}
         return (cm, groups) if return_groups else cm
     if n_types <= n_pal and n_major_groups is None:
+        # 类型数 ≤ 调色板长度：每个类型独占一色（保证零重复）。
+        # groups 仍来自空间聚类，可用于图例分组 / 标签标注。
         cm = {ct: palette[i] for i, ct in enumerate(unique_types)}
         return (cm, groups) if return_groups else cm
 
@@ -211,7 +213,8 @@ def color_h5ad(
     embedding_key: str = "X_umap",
     n_major_groups: int | None = None,
     palette: list[str] | None = None,
-) -> dict[str, str]:
+    return_groups: bool = False,
+) -> dict[str, str] | tuple[dict[str, str], dict[int, list[str]]]:
     """
     从 h5ad 文件 (backed 模式) 直接生成配色，不加载表达矩阵。
 
@@ -223,12 +226,12 @@ def color_h5ad(
         obs 中的标签列名，默认 ``"cell_type"``。
     embedding_key : str
         obsm 中的降维 key，默认 ``"X_umap"``。
-    n_major_groups, palette : 同 ``assign_celltype_colors``。
+    n_major_groups, palette, return_groups : 同 ``assign_celltype_colors``。
 
     Returns
     -------
-    dict[str, str]
-        label → hex color 映射。
+    dict[str, str]  或  (dict[str, str], dict[int, list[str]])
+        label → hex color 映射。若 return_groups=True，额外返回分组。
     """
     import anndata as ad
 
@@ -249,7 +252,9 @@ def color_h5ad(
     finally:
         adata.file.close()
 
-    return assign_celltype_colors(coords, labels, n_major_groups, palette)
+    return assign_celltype_colors(
+        coords, labels, n_major_groups, palette, return_groups=return_groups,
+    )
 
 
 # ══════════════════════════════════════════════════════════
@@ -357,7 +362,7 @@ def plot_umap(
         for gid in sorted_gids:
             handles_labels.append((
                 Line2D([0], [0], marker="none", linestyle="none"),
-                f"$\\bf{{{group_names[gid]}}}$",
+                group_names[gid],
             ))
             for ct in groups[gid]:
                 handles_labels.append((
@@ -382,7 +387,7 @@ def plot_umap(
         ]
 
     ncol = legend_columns or max(1, (len(handles_labels) + 24) // 25)
-    ax.legend(
+    leg = ax.legend(
         [h for h, _ in handles_labels],
         [l for _, l in handles_labels],
         fontsize=legend_fontsize,
@@ -391,6 +396,12 @@ def plot_umap(
         handletextpad=0.3, labelspacing=0.35,
         columnspacing=1.0, borderpad=0,
     )
+    # 组名加粗（不用 LaTeX，避免下划线等特殊字符问题）
+    if group_legend:
+        group_name_set = set(group_names.values())
+        for text in leg.get_texts():
+            if text.get_text() in group_name_set:
+                text.set_fontweight("bold")
 
     # ── 样式 ──
     ax.set_xlabel(xlabel, fontsize=12)
@@ -486,15 +497,23 @@ def _compute_centroids_fast(
 
 
 def _auto_determine_k(Z: np.ndarray, n_types: int) -> int:
-    """在 dendrogram 合并距离中找最大相对间距跳跃。"""
+    """在 dendrogram 合并距离中找最大相对间距跳跃。
+
+    搜索窗口和 k 上限随 n_types 自适应缩放，适用于几十到几百种类型。
+    """
     if n_types <= 3:
         return n_types
     distances = Z[:, 2]
     gaps = np.diff(distances)
     rel_gaps = gaps / (distances[:-1] + 1e-10)
-    start = max(0, len(rel_gaps) - min(25, n_types - 1))
-    best = start + np.argmax(rel_gaps[start:])
-    return max(3, min(n_types - best - 1, 15))
+    # 搜索窗口：小数据看全部，大数据看顶部 1/3（至少 25 个）
+    window = min(n_types - 1, max(25, n_types // 3))
+    start = max(0, len(rel_gaps) - window)
+    best = start + int(np.argmax(rel_gaps[start:]))
+    k = n_types - best - 1
+    # 下限 3，上限随数据规模缩放（palette 12 色约支持 n_pal//2=6 组无复用）
+    k_max = max(15, n_types // 4)
+    return max(3, min(k, k_max))
 
 
 def _build_ordered_groups(
@@ -569,5 +588,8 @@ def _group_display_name(members: list[str]) -> str:
 
 
 def _is_dark(hex_color: str) -> bool:
-    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    h = hex_color.lstrip("#")
+    if len(h) == 3:
+        h = h[0] * 2 + h[1] * 2 + h[2] * 2
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     return 0.299 * r + 0.587 * g + 0.114 * b < 140
