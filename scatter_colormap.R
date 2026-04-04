@@ -415,22 +415,42 @@ color_sce <- function(sce, dimred = "UMAP", col_name = "cell_type", ...) {
 
 
 .auto_determine_k <- function(hc, n_types) {
-  # 在 dendrogram 合并距离中找最大相对间距跳跃
-  # 搜索窗口和 k 上限随 n_types 自适应缩放
+  # 在 dendrogram 合并距离中寻找自然切分点
+  # 策略：找第一个超过中位数 2 倍的显著跳跃，避免被末尾巨大 gap 吸引
   if (n_types <= 3) return(n_types)
 
-  heights <- hc$height  # 已排序（升序）
+  heights <- hc$height
   gaps <- diff(heights)
   rel_gaps <- gaps / (heights[-length(heights)] + 1e-10)
 
+  k_max <- max(15, n_types %/% 4)
+  k_min <- 3
   n_gaps <- length(rel_gaps)
-  window <- min(n_types - 1, max(25, n_types %/% 3))
-  search_start <- max(1, n_gaps - window + 1)
-  best_idx <- search_start - 1 + which.max(rel_gaps[search_start:n_gaps])
+
+  # gap index i (1-based) 对应 k = n_types - i
+  idx_hi <- n_gaps - k_min + 1       # k=k_min
+  idx_lo <- max(1, n_gaps - k_max + 1) # k=k_max
+  if (idx_lo > idx_hi) { tmp <- idx_lo; idx_lo <- idx_hi; idx_hi <- tmp }
+
+  window_vals <- rel_gaps[idx_lo:idx_hi]
+  if (length(window_vals) == 0) return(k_min)
+
+  median_gap <- median(window_vals)
+  threshold <- median_gap * 2.0
+
+  # 回退值：窗口内全局最大
+  best_idx <- idx_lo - 1 + which.max(window_vals)
+
+  # 从低 index (大 k) 往高 index (小 k) 扫描
+  for (i in idx_lo:idx_hi) {
+    if (rel_gaps[i] >= threshold) {
+      best_idx <- i
+      break
+    }
+  }
 
   k <- n_types - best_idx
-  k_max <- max(15, n_types %/% 4)
-  max(3, min(k, k_max))
+  max(k_min, min(k, k_max))
 }
 
 

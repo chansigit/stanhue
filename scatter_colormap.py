@@ -497,23 +497,44 @@ def _compute_centroids_fast(
 
 
 def _auto_determine_k(Z: np.ndarray, n_types: int) -> int:
-    """在 dendrogram 合并距离中找最大相对间距跳跃。
+    """在 dendrogram 合并距离中寻找自然切分点。
 
-    搜索窗口和 k 上限随 n_types 自适应缩放，适用于几十到几百种类型。
+    策略：在搜索窗口内找到 relative gap 超过中位数 2 倍的第一个跳跃
+    （从低 k 往高 k 扫描），避免总是被最后几次合并的巨大 gap 吸引。
+    若无显著跳跃则回退到全局最大 gap。
     """
     if n_types <= 3:
         return n_types
     distances = Z[:, 2]
     gaps = np.diff(distances)
     rel_gaps = gaps / (distances[:-1] + 1e-10)
-    # 搜索窗口：小数据看全部，大数据看顶部 1/3（至少 25 个）
-    window = min(n_types - 1, max(25, n_types // 3))
-    start = max(0, len(rel_gaps) - window)
-    best = start + int(np.argmax(rel_gaps[start:]))
-    k = n_types - best - 1
-    # 下限 3，上限随数据规模缩放（palette 12 色约支持 n_pal//2=6 组无复用）
+
     k_max = max(15, n_types // 4)
-    return max(3, min(k, k_max))
+    k_min = 3
+    # 搜索窗口：对应 k 在 [k_min, k_max] 范围内的 gap 索引
+    # gap index i 对应 k = n_types - i - 1
+    idx_hi = len(rel_gaps) - k_min       # k=k_min 对应的 gap index
+    idx_lo = max(0, len(rel_gaps) - k_max)  # k=k_max 对应的 gap index
+    if idx_lo > idx_hi:
+        idx_lo, idx_hi = idx_hi, idx_lo
+
+    window = rel_gaps[idx_lo:idx_hi + 1]
+    if len(window) == 0:
+        return k_min
+
+    median_gap = float(np.median(window))
+    threshold = median_gap * 2.0
+
+    # 从低 gap index（大 k）往高 gap index（小 k）扫描，
+    # 找第一个超过阈值的跳跃 → 最细粒度的自然切分点
+    best = idx_lo + int(np.argmax(window))  # 回退值：窗口内最大
+    for i in range(idx_lo, idx_hi + 1):
+        if rel_gaps[i] >= threshold:
+            best = i
+            break
+
+    k = n_types - best - 1
+    return max(k_min, min(k, k_max))
 
 
 def _build_ordered_groups(
