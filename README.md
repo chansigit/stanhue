@@ -131,32 +131,26 @@ colors <- color_sce(sce_obj, dimred = "UMAP", col_name = "cell_type")
 
 ## <a name="algorithm"></a>Algorithm
 
-```
-2D coords + labels
-      |
-      v
-1. Centroid per category
-      |
-      v
-2. Ward hierarchical clustering on centroids
-   -> auto-determine k via relative gap (k in [3, 15])
-      |
-      v
-3. Order within groups:
-   - dominant (most points) -> position 0
-   - rest by dendrogram leaf order
-      |
-      v
-4. Assign palette offsets between groups:
-   - sorted by total count (descending)
-   - step = 2 in Paired palette (0->2->4->6->8->10)
-   - >6 groups: fill odd slots (1->3->5->7->9->11)
-      |
-      v
-5. Walk palette from each group's offset (mod palette_len)
-      |
-      v
-Output: { label: "#hex" }
+```mermaid
+flowchart TD
+    A["🔢 Input: 2D coords + labels"] --> B["1️⃣ Compute centroid per category"]
+    B --> C["2️⃣ Ward hierarchical clustering on centroids"]
+    C --> D{"Auto-determine k?"}
+    D -- "Yes" --> E["Scan dendrogram gaps from<br/>large k → small k, pick first<br/>significant jump (≥ 2× median)"]
+    D -- "No (user-specified)" --> F["Use provided n_major_groups"]
+    E --> G["3️⃣ Cut dendrogram into k groups"]
+    F --> G
+    G --> H["4️⃣ Order within each group:<br/>• dominant (most cells) → position 0<br/>• rest by dendrogram leaf order"]
+    H --> I["5️⃣ Sort groups by total cell count (descending)<br/>assign palette offsets with step = 2"]
+    I --> J{"n_groups > palette_size / 2?"}
+    J -- "No" --> K["Offsets: 0, 2, 4, 6, 8, 10"]
+    J -- "Yes" --> L["Interleave: evens first,<br/>then odds, then cycle"]
+    K --> M["6️⃣ Walk palette from each<br/>group's offset (mod palette_len)"]
+    L --> M
+    M --> N["✅ Output: { label: '#hex' }"]
+
+    style A fill:#f0f0f0,stroke:#333
+    style N fill:#d4edda,stroke:#28a745
 ```
 
 The algorithm is **deterministic** — same input always produces the same colors.
