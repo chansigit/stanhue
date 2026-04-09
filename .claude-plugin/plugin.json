@@ -1,0 +1,19 @@
+{
+  "name": "stanhue",
+  "displayName": "stanhue",
+  "description": "Hierarchical auto-coloring for scatter plots with categorical labels",
+  "version": "1.0.0",
+  "author": {
+    "name": "chansigit"
+  },
+  "homepage": "https://github.com/chansigit/stanhue",
+  "repository": "https://github.com/chansigit/stanhue",
+  "license": "MIT",
+  "keywords": [
+    "single-cell",
+    "UMAP",
+    "color-palette",
+    "visualization",
+    "bioinformatics"
+  ]
+}

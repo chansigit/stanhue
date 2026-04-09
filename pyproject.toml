@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stanhue"
+version = "1.0.0"
+description = "Hierarchical auto-coloring for scatter plots with categorical labels"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{name = "Sijie Chen"}]
+dependencies = [
+    "numpy>=1.22",
+    "scipy>=1.7",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.5", "scanpy>=1.9"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+only-include = ["scatter_colormap.py"]

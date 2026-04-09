@@ -87,7 +87,9 @@ colors <- assign_celltype_colors(coords, labels)
 
 ## Installation
 
-No package manager needed. Just copy the script you need:
+### Script (no package manager needed)
+
+Just copy the script you need:
 
 | Language | File | Dependencies |
 |----------|------|-------------|
@@ -100,6 +102,14 @@ pip install numpy scipy
 
 # R — no extra packages needed for core functionality
 ```
+
+### Claude Code plugin
+
+```
+/plugins add chansigit/stanhue
+```
+
+Once installed, mention "stanhue" to Claude and the skill activates automatically.
 
 ## <a name="python"></a>Python API
 
