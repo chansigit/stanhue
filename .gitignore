@@ -1,0 +1,15 @@
+# macOS / editor junk
+._*
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+
+# R
+.Rhistory
+.RData

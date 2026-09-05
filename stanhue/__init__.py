@@ -13,7 +13,7 @@ from .scatter_colormap import (
     plot_umap,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 __all__ = [
     "PAIRED_PALETTE",
