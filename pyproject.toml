@@ -20,3 +20,6 @@ plot = ["matplotlib>=3.5", "scanpy>=1.9"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["stanhue"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["stanhue", "scatter_colormap.R", "README.md", "LICENSE", "pyproject.toml"]
