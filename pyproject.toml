@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stanhue"
-version = "1.0.0"
+version = "1.1.0"
 description = "Hierarchical auto-coloring for scatter plots with categorical labels"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -19,5 +19,4 @@ dependencies = [
 plot = ["matplotlib>=3.5", "scanpy>=1.9"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["."]
-only-include = ["scatter_colormap.py"]
+packages = ["stanhue"]

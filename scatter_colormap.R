@@ -13,6 +13,9 @@
 #   3. 组内最大亚群排首位 (dominant)，其余按 dendrogram 叶序
 #   4. 各大类以步长 2 在调色板上错开起始位 → dominant color 互不相同
 #   5. 组内从偏移位顺延取色
+#   6. 重叠感知 (overlap_aware=TRUE): 在 2D 空间中混在一起的类别，在各自
+#      可选的槽位里挑 CIELAB ΔE 最远的颜色；类别数 ≤ 调色板长度时，
+#      按最远点采样顺序发色（2 类不再是浅蓝 + 深蓝）
 #
 # Quick Start:
 #   source("scatter_colormap.R")
@@ -76,7 +79,7 @@ PAIRED_PALETTE <- c(
 # ══════════════════════════════════════════════════════════════════════════════
 
 #' 共享聚类流水线（内部函数）
-#' @return list(groups, unique_types, type_counts)
+#' @return list(groups, unique_types, type_counts, coords, codes)
 .cluster_pipeline <- function(coords, labels, n_major_groups = NULL) {
   validated <- .validate_inputs(coords, labels)
   coords <- validated$coords
@@ -84,6 +87,7 @@ PAIRED_PALETTE <- c(
 
   unique_types <- sort(unique(labels))
   n_types <- length(unique_types)
+  codes <- as.integer(factor(labels, levels = unique_types))  # 1-indexed
 
   if (n_types < 2) {
     groups <- list()
@@ -93,7 +97,7 @@ PAIRED_PALETTE <- c(
       type_counts <- setNames(sum(labels == unique_types), unique_types)
     }
     return(list(groups = groups, unique_types = unique_types,
-                type_counts = type_counts))
+                type_counts = type_counts, coords = coords, codes = codes))
   }
 
   # 向量化质心计算
@@ -111,7 +115,7 @@ PAIRED_PALETTE <- c(
   type_counts <- table(labels)[unique_types]
   groups <- .build_ordered_groups(unique_types, cluster_ids, type_counts, hc)
   list(groups = groups, unique_types = unique_types,
-       type_counts = type_counts)
+       type_counts = type_counts, coords = coords, codes = codes)
 }
 
 
@@ -122,12 +126,19 @@ PAIRED_PALETTE <- c(
 #' @param n_major_groups  integer|NULL, 手动指定大类数量。NULL 自动确定
 #' @param palette    character vector, 有序调色板。NULL 使用 PAIRED_PALETTE
 #' @param return_groups  logical, 若 TRUE 返回 list(colors, groups)
+#' @param overlap_aware  logical, 默认 TRUE。在 2D 空间中相互重叠的类别会被
+#'                   分配感知距离 (CIELAB ΔE) 尽量远的颜色；不重叠的类别
+#'                   保持原有层级配色。FALSE 完全回退到旧行为
+#' @param overlap_threshold  numeric [0,1], 默认 0.1。两类别的空间混合度
+#'                   (见 .compute_overlap) 低于该值时视为"不重叠"
 #' @return named character vector: cell_type → hex color;
 #'         若 return_groups=TRUE, 返回 list(colors=..., groups=...)
 assign_celltype_colors <- function(coords, labels,
                                    n_major_groups = NULL,
                                    palette = NULL,
-                                   return_groups = FALSE) {
+                                   return_groups = FALSE,
+                                   overlap_aware = TRUE,
+                                   overlap_threshold = 0.1) {
   if (is.null(palette)) palette <- PAIRED_PALETTE
   n_pal <- length(palette)
 
@@ -143,8 +154,25 @@ assign_celltype_colors <- function(coords, labels,
   }
   if (n_types == 0) return(.ret(character(0)))
   if (n_types == 1) return(.ret(setNames(palette[1], unique_types)))
+
+  # 重叠矩阵 + 调色板内两两感知色差
+  if (overlap_aware) {
+    overlap <- .compute_overlap(res$coords, res$codes, n_types)
+    overlap[overlap < overlap_threshold] <- 0
+    delta_e <- .palette_delta_e(palette)
+  } else {
+    overlap <- matrix(0, n_types, n_types)
+    delta_e <- matrix(0, n_pal, n_pal)
+  }
+  type_to_idx <- setNames(seq_len(n_types), unique_types)
+  assigned <- rep(NA_integer_, n_types)  # type_idx → palette_idx (1-indexed)
+
   if (n_types <= n_pal && is.null(n_major_groups)) {
-    return(.ret(setNames(palette[seq_len(n_types)], unique_types)))
+    # 类型数 ≤ 调色板长度：每个类型独占一色（保证零重复）。
+    # overlap_aware 时按 CIELAB 最远点采样顺序发色，先发差异最大的颜色
+    slots <- if (overlap_aware) .spread_order(palette, delta_e) else seq_len(n_types)
+    assigned <- .greedy_assign(seq_len(n_types), slots, overlap, delta_e, assigned)
+    return(.ret(setNames(palette[assigned], unique_types)))
   }
 
   # Step 4: 按总细胞数排序，分配偏移
@@ -162,19 +190,22 @@ assign_celltype_colors <- function(coords, labels,
     offsets <- base[((seq_len(n_groups) - 1) %% length(base)) + 1]
   }
 
-  # Step 5: 组内顺延取色 (0-indexed offset, 转 1-indexed palette)
-  color_map <- character(0)
-  for (idx in seq_along(sorted_gids)) {
-    gid <- sorted_gids[idx]
-    offset <- offsets[idx]
-    members <- groups[[gid]]
-    for (i in seq_along(members)) {
-      pal_idx <- ((offset + i - 1) %% n_pal) + 1  # R 的 1-indexed
-      color_map[members[i]] <- palette[pal_idx]
-    }
+  # Step 5: 取色，两级贪心（无重叠时与旧算法完全一致）：
+  #   组级：每组 dominant 从剩余 offset 池中挑与已分配重叠类别色差最大的位置
+  #        （无重叠则保留自己原本的 offset），全组占据从该 offset 起的连续一段 → 色系结构不变
+  #   组内：其余成员若与已分配类别重叠，则在本组槽位中挑感知距离最远的，
+  #        否则按叶序顺延
+  # offset 池用 1-indexed palette 位置表示
+  dominants <- vapply(sorted_gids, function(gid) unname(type_to_idx[groups[[gid]][1]]), integer(1))
+  assigned <- .greedy_assign(unname(dominants), offsets + 1, overlap, delta_e, assigned)
+  for (gid in sorted_gids) {
+    members <- unname(type_to_idx[groups[[gid]]])
+    start <- assigned[members[1]]
+    slots <- ((start - 1 + seq_along(members) - 1) %% n_pal) + 1
+    assigned <- .greedy_assign(members[-1], slots[-1], overlap, delta_e, assigned)
   }
 
-  .ret(color_map)
+  .ret(setNames(palette[assigned], unique_types))
 }
 
 
@@ -411,6 +442,119 @@ color_sce <- function(sce, dimred = "UMAP", col_name = "cell_type", ...) {
   centroids <- sums / counts
   rownames(centroids) <- unique_types
   centroids
+}
+
+
+.compute_overlap <- function(coords, codes, n_types, n_bins = NULL) {
+  # 类别两两之间的 2D 空间重叠度矩阵，取值 [0, 1]，对角线为 0。
+  # 把坐标切成 n_bins x n_bins 网格。对类别 a 的每个细胞，看它所在格子里
+  # 属于类别 b 的细胞占比，再对 a 的所有细胞取平均 —— 网格近似的
+  # "近邻标签混合度" mix[a, b]。取 max(mix[a, b], mix[b, a]) 对称化，
+  # 这样"小群嵌在大群里"也能被识别。
+  # 网格粗细随细胞数自适应：平均每格约 20 个细胞，范围 [16, 128]。
+  n_cells <- nrow(coords)
+  if (is.null(n_bins))
+    n_bins <- as.integer(min(128, max(16, round(sqrt(n_cells / 20)))))
+
+  mins <- apply(coords, 2, min)
+  spans <- apply(coords, 2, max) - mins
+  spans[spans == 0] <- 1
+  ix <- pmin(floor((coords[, 1] - mins[1]) / spans[1] * n_bins), n_bins - 1)
+  iy <- pmin(floor((coords[, 2] - mins[2]) / spans[2] * n_bins), n_bins - 1)
+  bin_id <- ix * n_bins + iy + 1  # 1-indexed
+  n_total_bins <- n_bins * n_bins
+
+  # H[t, bin] = 类别 t 在该格子的细胞数
+  H <- matrix(
+    tabulate((codes - 1) * n_total_bins + bin_id, nbins = n_types * n_total_bins),
+    nrow = n_types, byrow = TRUE
+  )
+  share <- sweep(H, 2, pmax(colSums(H), 1), "/")  # 每格内各类别占比
+  p <- H / pmax(rowSums(H), 1)                    # 各类别的空间分布
+  mix <- p %*% t(share)                           # mix[a, b]
+  overlap <- pmax(mix, t(mix))
+  diag(overlap) <- 0
+  overlap
+}
+
+
+.hex_to_lab <- function(hex_colors) {
+  # hex (sRGB, D65) → CIELAB，n x 3 矩阵。与 Python 版公式一致。
+  rgb <- t(grDevices::col2rgb(hex_colors)) / 255
+  lin <- ifelse(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055)^2.4)
+  m <- matrix(c(0.4124564, 0.3575761, 0.1804375,
+                0.2126729, 0.7151522, 0.0721750,
+                0.0193339, 0.1191920, 0.9503041), nrow = 3, byrow = TRUE)
+  xyz <- sweep(lin %*% t(m), 2, c(0.95047, 1.0, 1.08883), "/")
+  d <- 6 / 29
+  f <- ifelse(xyz > d^3, xyz^(1 / 3), xyz / (3 * d^2) + 4 / 29)
+  cbind(L = 116 * f[, 2] - 16,
+        a = 500 * (f[, 1] - f[, 2]),
+        b = 200 * (f[, 2] - f[, 3]))
+}
+
+
+.palette_delta_e <- function(palette) {
+  # 调色板内两两 CIE76 ΔE 矩阵
+  as.matrix(dist(.hex_to_lab(palette)))
+}
+
+
+.spread_order <- function(palette, delta_e) {
+  # 调色板的"最远点采样"顺序：以白色 (L=100, a=b=0) 为第 0 个锚点，
+  # 第一个选中的是与白色对比最强的深饱和色，之后每次选与已选颜色最小 ΔE 最大的。
+  n <- nrow(delta_e)
+  lab <- .hex_to_lab(palette)
+  min_d <- sqrt(rowSums(sweep(lab, 2, c(100, 0, 0))^2))
+  start <- which.max(min_d)
+  ord <- start
+  chosen <- logical(n)
+  chosen[start] <- TRUE
+  min_d <- pmin(min_d, delta_e[start, ])
+  for (k in seq_len(n - 1)) {
+    min_d[chosen] <- -Inf
+    nxt <- which.max(min_d)
+    ord <- c(ord, nxt)
+    chosen[nxt] <- TRUE
+    min_d <- pmin(min_d, delta_e[nxt, ])
+  }
+  unname(ord)
+}
+
+
+.greedy_assign <- function(type_ids, slots, overlap, delta_e, assigned) {
+  # 重叠感知的贪心取色。assigned: 长度 n_types 的整数向量 (NA = 未分配)，
+  # 返回更新后的向量。
+  # - slots 是候选调色板位置（按默认优先顺序），每个位置只用一次
+  # - 处理顺序：与其他类别总重叠量大的先选
+  # - 类别 a 在位置 s 的得分 = sum_b overlap[a, b] * ΔE(s, color_b)，
+  #   b 遍历已分配类别。得分全 0（无重叠）→ 取自己的默认位置 slots[i]
+  #   （若已被占则取第一个未用位置）。
+  if (length(type_ids) == 0) return(assigned)
+  if (length(slots) < length(type_ids))
+    stop(sprintf("need %d slots but only %d given", length(type_ids), length(slots)))
+  remaining <- slots
+  # 默认位置：type_ids[i] ↔ slots[i]（旧算法的结果）。无重叠的类别尽量保留
+  # 默认位置，避免一个类别换位后其余类别全部顺延（级联）。
+  preferred <- setNames(slots[seq_along(type_ids)], type_ids)
+  total_overlap <- rowSums(overlap)
+  ord <- type_ids[order(-total_overlap[type_ids], seq_along(type_ids))]
+
+  for (a in ord) {
+    pref <- preferred[[as.character(a)]]
+    best <- if (pref %in% remaining) pref else remaining[1]
+    done <- which(!is.na(assigned))
+    if (length(done) > 0) {
+      w <- overlap[a, done]
+      if (any(w > 0)) {
+        scores <- delta_e[remaining, assigned[done], drop = FALSE] %*% w
+        best <- remaining[which.max(scores)]
+      }
+    }
+    assigned[a] <- best
+    remaining <- remaining[-match(best, remaining)]
+  }
+  assigned
 }
 
 

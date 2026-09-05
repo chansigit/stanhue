@@ -54,6 +54,15 @@ UMAP coords + cell type labels
   5. Each group walks palette from its offset (mod palette_len)
         │
         ▼
+  6. Overlap-aware refinement (overlap_aware=True, default):
+     - grid-based neighbor-label mixing → pairwise overlap matrix
+     - dominant of each group keeps its anchor color
+     - other members that overlap in 2D pick, among the group's slots,
+       the color with max CIELAB ΔE to the types they overlap with
+     - if n_types ≤ palette length: farthest-point order in CIELAB
+       (2 classes → e.g. dark red + dark purple, never light + dark blue)
+        │
+        ▼
   Output: { cell_type: "#hex_color" }
 ```
 
@@ -195,11 +204,14 @@ The offset logic adapts automatically: step size = `len(palette) // n_groups`
 | `labels` | required | Cell type labels, length n |
 | `n_major_groups` | `None`/auto | Number of lineage groups (auto uses relative gap) |
 | `palette` | `PAIRED_PALETTE` | Ordered hex color list |
+| `overlap_aware` | `True` | Spatially overlapping types get perceptually distant colors; non-overlapping types keep the hierarchical scheme. `False` = legacy behavior |
+| `overlap_threshold` | `0.1` | Mixing score below which two types count as non-overlapping (0–1) |
 
 ## When Results Need Manual Adjustment
 
 - If two visually distinct clusters share a color, increase `n_major_groups`.
 - If related subtypes get unrelated colors, decrease `n_major_groups`.
+- If two overlapping types still look alike, lower `overlap_threshold` (e.g. 0.05); if colors within a lineage look too scrambled, raise it or set `overlap_aware=False`.
 - For >30 cell types, consider a larger custom palette (e.g., 20-color set).
 
 ## Scope

@@ -61,6 +61,7 @@ then assigning colors so that:
 - **Distant groups** get different hue families (blue vs red vs green)
 - **Related categories** get adjacent shades within the same family
 - **Dominant categories** (most points) anchor each group's representative color
+- **Overlapping categories** (points mixed together in 2D) get perceptually distant colors, even if they belong to the same group
 
 It returns a simple `{label: hex_color}` mapping. You bring your own plotting
 code.
@@ -87,13 +88,21 @@ colors <- assign_celltype_colors(coords, labels)
 
 ## Installation
 
+### pip (Python)
+
+```bash
+pip install git+https://github.com/chansigit/stanhue.git
+```
+
+Then `from stanhue import assign_celltype_colors`.
+
 ### Script (no package manager needed)
 
 Just copy the script you need:
 
 | Language | File | Dependencies |
 |----------|------|-------------|
-| Python | `scatter_colormap.py` | `numpy`, `scipy` |
+| Python | `stanhue/scatter_colormap.py` (standalone, no package needed) | `numpy`, `scipy` |
 | R | `scatter_colormap.R` | base R only (`stats`) |
 
 ```bash
@@ -122,6 +131,8 @@ color_map = assign_celltype_colors(
     labels,              # (n,) array — categorical labels
     n_major_groups=None,  # auto-detect, or set manually
     palette=None,         # default: PAIRED_PALETTE (12 colors)
+    overlap_aware=True,   # overlapping categories get distant colors
+    overlap_threshold=0.1,
 )
 
 # Inspect grouping structure
@@ -157,7 +168,8 @@ flowchart TD
     J -- "Yes" --> L["Interleave: evens first,<br/>then odds, then cycle"]
     K --> M["6️⃣ Walk palette from each<br/>group's offset (mod palette_len)"]
     L --> M
-    M --> N["✅ Output: { label: '#hex' }"]
+    M --> O["7️⃣ Overlap-aware refinement:<br/>grid-based label mixing → overlap matrix<br/>dominant keeps anchor; overlapping members<br/>pick max CIELAB ΔE slot within the group"]
+    O --> N["✅ Output: { label: '#hex' }"]
 
     style A fill:#f0f0f0,stroke:#333
     style N fill:#d4edda,stroke:#28a745
@@ -185,11 +197,15 @@ The offset logic adapts automatically.
 | `labels` | *required* | Categorical labels, length `n` |
 | `n_major_groups` | auto | Number of top-level groups. `None` = auto-detect via relative gap |
 | `palette` | `PAIRED_PALETTE` | Ordered hex color list of any length |
+| `overlap_aware` | `True` | Categories that overlap in 2D get perceptually distant colors (CIELAB ΔE). Non-overlapping categories keep the hierarchical scheme. `False` = legacy behavior |
+| `overlap_threshold` | `0.1` | Spatial mixing score (0–1) below which two categories are treated as non-overlapping |
 
 ## Tips
 
 - **Two clusters share a color?** Increase `n_major_groups`.
 - **Related categories got unrelated colors?** Decrease `n_major_groups`.
+- **Two overlapping categories still look alike?** Lower `overlap_threshold` (e.g. 0.05). **Colors within a lineage look scrambled?** Raise it, or set `overlap_aware=False`.
+- **Few categories (≤ palette size)?** Colors are handed out in farthest-point order in CIELAB, so 2 categories get two strongly contrasting hues rather than light/dark of the same hue.
 - **30+ categories?** Consider a larger palette (e.g., 20 colors).
 - Works with **any** 2D embedding: UMAP, tSNE, PCA, PHATE, etc.
 - Not limited to single-cell data — any scatter plot with categorical labels.

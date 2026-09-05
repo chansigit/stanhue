@@ -13,6 +13,9 @@ scatter_colormap.py — 通用单细胞 UMAP 层级化自动配色工具
   3. 组内最大亚群排首位 (dominant)，其余按 dendrogram 叶序
   4. 各大类以步长 2 在调色板上错开起始位 → dominant color 互不相同
   5. 组内从偏移位顺延取色
+  6. 重叠感知 (overlap_aware=True): 在 2D 空间中混在一起的类别，在各自
+     可选的槽位里挑 CIELAB ΔE 最远的颜色；类别数 ≤ 调色板长度时，
+     按最远点采样顺序发色（2 类不再是浅蓝 + 深蓝）
 
 Quick Start:
   >>> from scatter_colormap import assign_celltype_colors, plot_umap
@@ -56,8 +59,10 @@ PAIRED_PALETTE: list[str] = [
 #  输入验证
 # ══════════════════════════════════════════════════════════
 
+
 def _validate_inputs(
-    coords: np.ndarray, labels: np.ndarray,
+    coords: np.ndarray,
+    labels: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """验证输入合法性，返回规范化的 (coords, labels)。"""
     coords = np.asarray(coords, dtype=float)
@@ -82,12 +87,15 @@ def _validate_inputs(
 #  核心 API
 # ══════════════════════════════════════════════════════════
 
+
 def _cluster_pipeline(
     coords: np.ndarray,
     labels: np.ndarray,
     n_major_groups: int | None = None,
-) -> tuple[dict[int, list[str]], np.ndarray, np.ndarray, np.ndarray]:
-    """共享聚类流水线，返回 (groups, unique_types, type_counts, Z)。"""
+) -> tuple[
+    dict[int, list[str]], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:
+    """共享聚类流水线，返回 (groups, unique_types, type_counts, Z, coords, codes)。"""
     coords, labels = _validate_inputs(coords, labels)
 
     # 向量化：字符串标签 → 整数编码，后续全部用整数操作
@@ -99,7 +107,7 @@ def _cluster_pipeline(
         if n_types == 1:
             groups[1] = [unique_types[0]]
         type_counts = np.bincount(codes, minlength=n_types)
-        return groups, unique_types, type_counts, np.empty((0, 4))
+        return groups, unique_types, type_counts, np.empty((0, 4)), coords, codes
 
     # 向量化质心计算
     centroids = _compute_centroids_fast(coords, codes, n_types)
@@ -114,7 +122,7 @@ def _cluster_pipeline(
     major_labels = fcluster(Z, t=n_major_groups, criterion="maxclust")
     type_counts = np.bincount(codes, minlength=n_types)
     groups = _build_ordered_groups(unique_types, major_labels, type_counts, Z)
-    return groups, unique_types, type_counts, Z
+    return groups, unique_types, type_counts, Z, coords, codes
 
 
 def assign_celltype_colors(
@@ -123,6 +131,8 @@ def assign_celltype_colors(
     n_major_groups: int | None = None,
     palette: list[str] | None = None,
     return_groups: bool = False,
+    overlap_aware: bool = True,
+    overlap_threshold: float = 0.1,
 ) -> dict[str, str] | tuple[dict[str, str], dict[int, list[str]]]:
     """
     给定 2D 坐标和细胞标签，返回 ``{cell_type: hex_color}``。
@@ -140,6 +150,14 @@ def assign_celltype_colors(
         可传入任意长度的 hex 颜色列表。
     return_groups : bool
         若为 True，同时返回分组信息，避免重复聚类。
+    overlap_aware : bool
+        若为 True（默认），在 2D 空间中相互重叠的类别会被分配感知距离
+        (CIELAB ΔE) 尽量远的颜色；不重叠的类别保持原有层级配色。
+        设为 False 则完全回退到旧行为。
+    overlap_threshold : float
+        两类别的空间混合度（一个类别的细胞周围属于另一类别的平均占比，
+        见 ``_compute_overlap``）低于该值时视为"不重叠"，不触发调整。
+        取值范围 [0, 1]，默认 0.1。
 
     Returns
     -------
@@ -150,8 +168,10 @@ def assign_celltype_colors(
         palette = PAIRED_PALETTE
     n_pal = len(palette)
 
-    groups, unique_types, type_counts, Z = _cluster_pipeline(
-        coords, labels, n_major_groups,
+    groups, unique_types, type_counts, _Z, coords, codes = _cluster_pipeline(
+        coords,
+        labels,
+        n_major_groups,
     )
     n_types = len(unique_types)
 
@@ -161,17 +181,35 @@ def assign_celltype_colors(
     if n_types == 1:
         cm = {unique_types[0]: palette[0]}
         return (cm, groups) if return_groups else cm
+
+    # 重叠矩阵 + 调色板内两两感知色差
+    if overlap_aware:
+        overlap = _compute_overlap(coords, codes, n_types)
+        overlap[overlap < overlap_threshold] = 0.0
+        delta_e = _palette_delta_e(palette)
+    else:
+        overlap = np.zeros((n_types, n_types))
+        delta_e = np.zeros((n_pal, n_pal))
+
+    type_to_idx = {ct: i for i, ct in enumerate(unique_types)}
+    assigned: dict[int, int] = {}  # type_idx → palette_idx
+
     if n_types <= n_pal and n_major_groups is None:
         # 类型数 ≤ 调色板长度：每个类型独占一色（保证零重复）。
         # groups 仍来自空间聚类，可用于图例分组 / 标签标注。
-        cm = {ct: palette[i] for i, ct in enumerate(unique_types)}
+        if overlap_aware:
+            # 默认取色顺序：在 CIELAB 中做最远点采样，先发色相差异最大的颜色
+            slots = _spread_order(palette, delta_e)
+        else:
+            slots = list(range(n_types))
+        _greedy_assign(list(range(n_types)), slots, overlap, delta_e, assigned)
+        cm = {ct: palette[assigned[i]] for i, ct in enumerate(unique_types)}
         return (cm, groups) if return_groups else cm
 
     # Step 4: 按总细胞数排序，分配偏移
     sorted_gids = sorted(
         groups,
-        key=lambda g: -sum(type_counts[np.searchsorted(unique_types, ct)]
-                           for ct in groups[g]),
+        key=lambda g: -sum(type_counts[type_to_idx[ct]] for ct in groups[g]),
     )
     n_groups = len(sorted_gids)
 
@@ -181,12 +219,20 @@ def assign_celltype_colors(
         base = list(range(0, n_pal, 2)) + list(range(1, n_pal, 2))
         offsets = [base[i % len(base)] for i in range(n_groups)]
 
-    # Step 5: 组内顺延取色
-    color_map: dict[str, str] = {}
-    for gid, offset in zip(sorted_gids, offsets):
-        for i, ct in enumerate(groups[gid]):
-            color_map[ct] = palette[(offset + i) % n_pal]
+    # Step 5: 取色，两级贪心（无重叠时与旧算法完全一致）：
+    #   组级：每组 dominant 从剩余 offset 池中挑与已分配重叠类别色差最大的位置
+    #        （无重叠则保留自己原本的 offset），全组占据从该 offset 起的连续一段 → 色系结构不变
+    #   组内：其余成员若与已分配类别重叠，则在本组槽位中挑感知距离最远的，
+    #        否则按叶序顺延
+    dominants = [type_to_idx[groups[gid][0]] for gid in sorted_gids]
+    _greedy_assign(dominants, list(offsets), overlap, delta_e, assigned)
+    for gid in sorted_gids:
+        members = [type_to_idx[ct] for ct in groups[gid]]
+        offset = assigned[members[0]]
+        slots = [(offset + i) % n_pal for i in range(len(members))]
+        _greedy_assign(members[1:], slots[1:], overlap, delta_e, assigned)
 
+    color_map = {ct: palette[assigned[type_to_idx[ct]]] for ct in unique_types}
     return (color_map, groups) if return_groups else color_map
 
 
@@ -203,7 +249,7 @@ def get_groups(
     dict[int, list[str]]
         group_id → [cell_type, ...]，每组首位是 dominant subtype。
     """
-    groups, _, _, _ = _cluster_pipeline(coords, labels, n_major_groups)
+    groups, *_ = _cluster_pipeline(coords, labels, n_major_groups)
     return groups
 
 
@@ -214,6 +260,8 @@ def color_h5ad(
     n_major_groups: int | None = None,
     palette: list[str] | None = None,
     return_groups: bool = False,
+    overlap_aware: bool = True,
+    overlap_threshold: float = 0.1,
 ) -> dict[str, str] | tuple[dict[str, str], dict[int, list[str]]]:
     """
     从 h5ad 文件 (backed 模式) 直接生成配色，不加载表达矩阵。
@@ -226,7 +274,8 @@ def color_h5ad(
         obs 中的标签列名，默认 ``"cell_type"``。
     embedding_key : str
         obsm 中的降维 key，默认 ``"X_umap"``。
-    n_major_groups, palette, return_groups : 同 ``assign_celltype_colors``。
+    n_major_groups, palette, return_groups, overlap_aware, overlap_threshold :
+        同 ``assign_celltype_colors``。
 
     Returns
     -------
@@ -239,27 +288,30 @@ def color_h5ad(
     try:
         if embedding_key not in adata.obsm:
             avail = list(adata.obsm.keys())
-            raise KeyError(
-                f"Embedding '{embedding_key}' not found. Available: {avail}"
-            )
+            raise KeyError(f"Embedding '{embedding_key}' not found. Available: {avail}")
         if label_key not in adata.obs.columns:
             avail = list(adata.obs.columns)
-            raise KeyError(
-                f"Label column '{label_key}' not found. Available: {avail}"
-            )
+            raise KeyError(f"Label column '{label_key}' not found. Available: {avail}")
         coords = np.asarray(adata.obsm[embedding_key][:, :2])
         labels = np.asarray(adata.obs[label_key])
     finally:
         adata.file.close()
 
     return assign_celltype_colors(
-        coords, labels, n_major_groups, palette, return_groups=return_groups,
+        coords,
+        labels,
+        n_major_groups,
+        palette,
+        return_groups=return_groups,
+        overlap_aware=overlap_aware,
+        overlap_threshold=overlap_threshold,
     )
 
 
 # ══════════════════════════════════════════════════════════
 #  可视化
 # ══════════════════════════════════════════════════════════
+
 
 def plot_umap(
     coords: np.ndarray,
@@ -336,9 +388,13 @@ def plot_umap(
         if not mask.any():
             continue
         ax.scatter(
-            coords[mask, 0], coords[mask, 1],
-            c=color_map[ct], s=point_size,
-            edgecolors="none", rasterized=True, zorder=2,
+            coords[mask, 0],
+            coords[mask, 1],
+            c=color_map[ct],
+            s=point_size,
+            edgecolors="none",
+            rasterized=True,
+            zorder=2,
         )
 
     # ── 质心标注 ──
@@ -350,40 +406,61 @@ def plot_umap(
                 continue
             cx, cy = coords[mask].mean(axis=0)
             ax.text(
-                cx, cy, group_names[gid],
-                fontsize=label_fontsize, fontweight=label_fontweight,
-                ha="center", va="center", color="#222222",
-                zorder=5, path_effects=stroke,
+                cx,
+                cy,
+                group_names[gid],
+                fontsize=label_fontsize,
+                fontweight=label_fontweight,
+                ha="center",
+                va="center",
+                color="#222222",
+                zorder=5,
+                path_effects=stroke,
             )
 
     # ── 图例 ──
     if group_legend:
         handles_labels: list[tuple] = []
         for gid in sorted_gids:
-            handles_labels.append((
-                Line2D([0], [0], marker="none", linestyle="none"),
-                group_names[gid],
-            ))
+            handles_labels.append(
+                (
+                    Line2D([0], [0], marker="none", linestyle="none"),
+                    group_names[gid],
+                )
+            )
             for ct in groups[gid]:
-                handles_labels.append((
-                    Line2D(
-                        [0], [0], marker="o", linestyle="none", color="w",
-                        markerfacecolor=color_map[ct],
-                        markersize=legend_marker_size, markeredgewidth=0,
-                    ),
-                    ct,
-                ))
+                handles_labels.append(
+                    (
+                        Line2D(
+                            [0],
+                            [0],
+                            marker="o",
+                            linestyle="none",
+                            color="w",
+                            markerfacecolor=color_map[ct],
+                            markersize=legend_marker_size,
+                            markeredgewidth=0,
+                        ),
+                        ct,
+                    )
+                )
     else:
         handles_labels = [
             (
                 Line2D(
-                    [0], [0], marker="o", linestyle="none", color="w",
+                    [0],
+                    [0],
+                    marker="o",
+                    linestyle="none",
+                    color="w",
                     markerfacecolor=color_map[ct],
-                    markersize=legend_marker_size, markeredgewidth=0,
+                    markersize=legend_marker_size,
+                    markeredgewidth=0,
                 ),
                 ct,
             )
-            for gid in sorted_gids for ct in groups[gid]
+            for gid in sorted_gids
+            for ct in groups[gid]
         ]
 
     ncol = legend_columns or max(1, (len(handles_labels) + 24) // 25)
@@ -391,10 +468,14 @@ def plot_umap(
         [h for h, _ in handles_labels],
         [l for _, l in handles_labels],
         fontsize=legend_fontsize,
-        bbox_to_anchor=(1.01, 1), loc="upper left",
-        frameon=False, ncol=ncol,
-        handletextpad=0.3, labelspacing=0.35,
-        columnspacing=1.0, borderpad=0,
+        bbox_to_anchor=(1.01, 1),
+        loc="upper left",
+        frameon=False,
+        ncol=ncol,
+        handletextpad=0.3,
+        labelspacing=0.35,
+        columnspacing=1.0,
+        borderpad=0,
     )
     # 组名加粗（不用 LaTeX，避免下划线等特殊字符问题）
     if group_legend:
@@ -440,7 +521,8 @@ def plot_palette(
     n_groups = len(sorted_gids)
 
     fig, ax = plt.subplots(
-        1, 1,
+        1,
+        1,
         figsize=(min(20, max_members * 1.5 + 2), max(3, n_groups * 1.0)),
         facecolor="white",
     )
@@ -453,21 +535,36 @@ def plot_palette(
             color = color_map.get(ct, "#cccccc")
             x = col * 1.4
             rect = mpatches.FancyBboxPatch(
-                (x, y), 1.2, 0.8, boxstyle="round,pad=0.06",
-                facecolor=color, edgecolor="white", linewidth=1.5,
+                (x, y),
+                1.2,
+                0.8,
+                boxstyle="round,pad=0.06",
+                facecolor=color,
+                edgecolor="white",
+                linewidth=1.5,
             )
             ax.add_patch(rect)
             display = f"★ {ct}" if col == 0 else ct
             text_color = "white" if _is_dark(color) else "#222222"
             ax.text(
-                x + 0.6, y + 0.4, display,
-                ha="center", va="center",
-                fontsize=5.5, color=text_color, fontweight="bold",
+                x + 0.6,
+                y + 0.4,
+                display,
+                ha="center",
+                va="center",
+                fontsize=5.5,
+                color=text_color,
+                fontweight="bold",
             )
         ax.text(
-            -0.3, y + 0.4, _group_display_name(members),
-            ha="right", va="center",
-            fontsize=9, fontweight="bold", color="#444444",
+            -0.3,
+            y + 0.4,
+            _group_display_name(members),
+            ha="right",
+            va="center",
+            fontsize=9,
+            fontweight="bold",
+            color="#444444",
         )
 
     ax.set_xlim(-2, max_members * 1.4 + 0.5)
@@ -485,8 +582,11 @@ def plot_palette(
 #  内部工具
 # ══════════════════════════════════════════════════════════
 
+
 def _compute_centroids_fast(
-    coords: np.ndarray, codes: np.ndarray, n_types: int,
+    coords: np.ndarray,
+    codes: np.ndarray,
+    n_types: int,
 ) -> np.ndarray:
     """向量化质心计算：用整数编码 + bincount 代替逐类 Python 循环。"""
     counts = np.bincount(codes, minlength=n_types).astype(float)
@@ -494,6 +594,150 @@ def _compute_centroids_fast(
     sum_x = np.bincount(codes, weights=coords[:, 0], minlength=n_types)
     sum_y = np.bincount(codes, weights=coords[:, 1], minlength=n_types)
     return np.column_stack([sum_x / counts, sum_y / counts])
+
+
+def _compute_overlap(
+    coords: np.ndarray,
+    codes: np.ndarray,
+    n_types: int,
+    n_bins: int | None = None,
+) -> np.ndarray:
+    """类别两两之间的 2D 空间重叠度矩阵，取值 [0, 1]，对角线为 0。
+
+    把坐标切成 n_bins × n_bins 网格。对类别 a 的每个细胞，看它所在格子里
+    属于类别 b 的细胞占比，再对 a 的所有细胞取平均 —— 相当于用网格近似的
+    "近邻标签混合度" mix[a, b]。最后取 max(mix[a, b], mix[b, a]) 对称化，
+    这样"小群嵌在大群里"（mix[小, 大] 高、mix[大, 小] 低）也能被识别。
+
+    网格粗细随细胞数自适应：平均每个格子约 20 个细胞，范围 [16, 128]。
+    """
+    n_cells = coords.shape[0]
+    if n_bins is None:
+        n_bins = int(np.clip(round(np.sqrt(n_cells / 20.0)), 16, 128))
+
+    mins = coords.min(axis=0)
+    spans = coords.max(axis=0) - mins
+    spans[spans == 0] = 1.0
+    ij = ((coords - mins) / spans * n_bins).astype(np.int64)
+    ij = np.clip(ij, 0, n_bins - 1)
+    bin_id = ij[:, 0] * n_bins + ij[:, 1]
+    n_total_bins = n_bins * n_bins
+
+    # H[t, bin] = 类别 t 在该格子的细胞数
+    H = (
+        np.bincount(
+            codes.astype(np.int64) * n_total_bins + bin_id,
+            minlength=n_types * n_total_bins,
+        )
+        .reshape(n_types, n_total_bins)
+        .astype(float)
+    )
+
+    bin_total = np.maximum(H.sum(axis=0, keepdims=True), 1.0)
+    share = H / bin_total  # 每格内各类别占比（列和为 1）
+    p = H / np.maximum(H.sum(axis=1, keepdims=True), 1.0)  # 各类别的空间分布
+    mix = p @ share.T  # mix[a, b] = a 的细胞所在格子里 b 的平均占比
+    overlap = np.maximum(mix, mix.T)
+    np.fill_diagonal(overlap, 0.0)
+    return overlap
+
+
+def _hex_to_lab(hex_colors: list[str]) -> np.ndarray:
+    """hex (sRGB, D65) → CIELAB，shape (n, 3)。纯 numpy，无外部依赖。"""
+    rgb = []
+    for h in hex_colors:
+        h = h.lstrip("#")
+        if len(h) == 3:
+            h = h[0] * 2 + h[1] * 2 + h[2] * 2
+        rgb.append([int(h[i : i + 2], 16) for i in (0, 2, 4)])
+    rgb_arr = np.asarray(rgb, dtype=float) / 255.0
+    lin = np.where(
+        rgb_arr <= 0.04045, rgb_arr / 12.92, ((rgb_arr + 0.055) / 1.055) ** 2.4
+    )
+    m = np.array(
+        [
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ]
+    )
+    xyz = (lin @ m.T) / np.array([0.95047, 1.0, 1.08883])
+    delta = 6.0 / 29.0
+    f = np.where(xyz > delta**3, np.cbrt(xyz), xyz / (3 * delta**2) + 4.0 / 29.0)
+    L = 116.0 * f[:, 1] - 16.0
+    a = 500.0 * (f[:, 0] - f[:, 1])
+    b = 200.0 * (f[:, 1] - f[:, 2])
+    return np.column_stack([L, a, b])
+
+
+def _palette_delta_e(palette: list[str]) -> np.ndarray:
+    """调色板内两两 CIE76 ΔE 矩阵，shape (n_pal, n_pal)。"""
+    lab = _hex_to_lab(palette)
+    diff = lab[:, None, :] - lab[None, :, :]
+    return np.sqrt((diff**2).sum(axis=-1))
+
+
+def _spread_order(palette: list[str], delta_e: np.ndarray) -> list[int]:
+    """调色板的"最远点采样"顺序：类别少时按此顺序发色，保证前几个颜色差异最大。
+
+    以白色背景 (L=100, a=b=0) 作为第 0 个锚点，因此第一个选中的是与白色
+    对比最强的深饱和色；之后每次选与所有已选颜色最小 ΔE 最大的颜色。
+    """
+    n = len(delta_e)
+    white = np.array([100.0, 0.0, 0.0])
+    min_d = np.sqrt(((_hex_to_lab(palette) - white) ** 2).sum(axis=1))
+    start = int(np.argmax(min_d))
+    order = [start]
+    chosen = np.zeros(n, dtype=bool)
+    chosen[start] = True
+    min_d = np.minimum(min_d, delta_e[start])
+    for _ in range(n - 1):
+        min_d[chosen] = -np.inf
+        nxt = int(np.argmax(min_d))
+        order.append(nxt)
+        chosen[nxt] = True
+        min_d = np.minimum(min_d, delta_e[nxt])
+    return order
+
+
+def _greedy_assign(
+    type_ids: list[int],
+    slots: list[int],
+    overlap: np.ndarray,
+    delta_e: np.ndarray,
+    assigned: dict[int, int],
+) -> None:
+    """重叠感知的贪心取色，就地更新 ``assigned`` (type_idx → palette_idx)。
+
+    - ``slots`` 是候选调色板位置（按默认优先顺序），每个位置只用一次。
+    - 处理顺序：与其他类别总重叠量大的先选。
+    - 对类别 a，候选位置 s 的得分 = Σ_b overlap[a, b] · ΔE(s, color_b)，
+      b 遍历所有已分配类别。得分全为 0（a 不与任何已分配类别重叠）时
+      取自己的默认位置 slots[i]（若已被占则取第一个未用位置），即保持原有层级配色。
+    """
+    if not type_ids:
+        return
+    if len(slots) < len(type_ids):
+        raise ValueError(f"need {len(type_ids)} slots but only {len(slots)} given")
+    remaining = list(slots)
+    position = {t: i for i, t in enumerate(type_ids)}
+    # 默认位置：type_ids[i] ↔ slots[i]（旧算法的结果）。无重叠的类别尽量保留
+    # 默认位置，避免一个类别换位后其余类别全部顺延（级联）。
+    preferred = {t: s for t, s in zip(type_ids, slots)}
+    total_overlap = overlap.sum(axis=1)
+    order = sorted(type_ids, key=lambda t: (-total_overlap[t], position[t]))
+
+    for a in order:
+        best = preferred[a] if preferred[a] in remaining else remaining[0]
+        if assigned:
+            b_idx = np.fromiter(assigned.keys(), dtype=np.int64, count=len(assigned))
+            p_idx = np.fromiter(assigned.values(), dtype=np.int64, count=len(assigned))
+            w = overlap[a, b_idx]
+            if w.any():
+                scores = delta_e[np.asarray(remaining)[:, None], p_idx[None, :]] @ w
+                best = remaining[int(np.argmax(scores))]
+        assigned[a] = best
+        remaining.remove(best)
 
 
 def _auto_determine_k(Z: np.ndarray, n_types: int) -> int:
@@ -513,12 +757,12 @@ def _auto_determine_k(Z: np.ndarray, n_types: int) -> int:
     k_min = 3
     # 搜索窗口：对应 k 在 [k_min, k_max] 范围内的 gap 索引
     # gap index i 对应 k = n_types - i - 1
-    idx_hi = len(rel_gaps) - k_min       # k=k_min 对应的 gap index
+    idx_hi = len(rel_gaps) - k_min  # k=k_min 对应的 gap index
     idx_lo = max(0, len(rel_gaps) - k_max)  # k=k_max 对应的 gap index
     if idx_lo > idx_hi:
         idx_lo, idx_hi = idx_hi, idx_lo
 
-    window = rel_gaps[idx_lo:idx_hi + 1]
+    window = rel_gaps[idx_lo : idx_hi + 1]
     if len(window) == 0:
         return k_min
 
@@ -589,7 +833,7 @@ def _common_prefix(strings: list[str]) -> str:
             if len(s) > len(clean) and s[len(clean)].isdigit():
                 for i in range(len(clean) - 1, -1, -1):
                     if not clean[i].isdigit():
-                        c = clean[:i + 1].rstrip(" _")
+                        c = clean[: i + 1].rstrip(" _")
                         return c if len(c) >= 2 else ""
                 return ""
     return clean
